@@ -146,7 +146,7 @@ if __name__ == "__main__":
     swanlab_run = None
     if args.use_swanlab:
         import swanlab
-        swanlab.login(api_key="你的swanlab key")
+        swanlab.login(api_key="MZYVfvNPgeYBDNNoD5zoN")
         swanlab_id = ckp_data.get('swanlab_id') if ckp_data else None
         swanlab_run = swanlab.init(
             project=args.swanlab_project,
