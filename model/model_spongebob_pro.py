@@ -1,11 +1,11 @@
-import torch
 import math
+import torch
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
-from typing import Optional, Tuple, Union, List
-from transformers import PreTrainedModel, GenerationMixin
+from typing import Optional, Tuple, List, Union
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from .config import SpongeBobConfig
 
@@ -15,61 +15,70 @@ class RMSNorm(torch.nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-    def _norm(self,x):
-        return x*torch.rqrt(x,pow(2).mean(-1,keepdim=True)+self.eps)
-    def forward(self,x):
-        return self.weight*self.norm(x.float()).type_as(x)
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        return self.weight * self._norm(x.float()).type_as(x)
 
 
-    
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6):
-    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2).float() / dim))
-    freqs = torch.outer(torch.arange(end, device=freqs.device), freqs).float()
-    freqs_cos=torch.cat([torch.cos(freqs),torch.cos(freqs)],dim=-1)
-    freqs_sin=torch.cat([torch.sin(freqs),torch.sin(freqs)],dim=-1)
-    return freqs_cos,freqs_sin
+    """
+    预计算 RoPE (Rotary Position Embedding) 的 cos 和 sin 频率
+    
+    Args:
+        dim: 注意力头的维度 (head_dim)
+        end: 最大序列长度
+        rope_base: RoPE 的基础频率，默认 1e6
+    
+    Returns:
+        freqs_cos: cos 频率张量 (end, dim)
+        freqs_sin: sin 频率张量 (end, dim)
+    """
+    # 计算频率：θ_i = base^(-2i/d), i ∈ [0, d/2)
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    
+    # 生成位置索引 [0, 1, 2, ..., end-1]
+    t = torch.arange(end, device=freqs.device)
+    
+    # 计算每个位置的频率：pos * θ_i
+    freqs = torch.outer(t, freqs).float()
+    
+    # 计算 cos 和 sin，并复制一次（用于 rotate_half）
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+    
+    return freqs_cos, freqs_sin
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
-    应用 RoPE
+    应用 RoPE (Rotary Position Embedding) 到 query 和 key
+    
     Args:
-        position_ids: (batch, seq_len) 用于推理时指定位置
+        q: Query 张量 (batch, seq_len, num_heads, head_dim)
+        k: Key 张量 (batch, seq_len, num_kv_heads, head_dim)
+        cos: 预计算的 cos 频率
+        sin: 预计算的 sin 频率
+        unsqueeze_dim: 用于广播的维度
+    
+    Returns:
+        q_embed: 应用 RoPE 后的 query
+        k_embed: 应用 RoPE 后的 key
     """
-    # 1. 处理 cos/sin 的切片 (支持推理/KV Cache)
-    # 如果传入了 position_ids，则根据 id 选取对应的 cos/sin
-    if position_ids is not None:
-        # cos: (end, dim) -> (batch, seq_len, dim)
-        cos = cos[position_ids]
-        sin = sin[position_ids]
-        
-        # 此时 cos/sin 已经是 (batch, seq_len, dim)，我们需要广播到 head 维度
-        # q: (batch, seq, heads, dim)
-        # 这种情况下通常 unsqueeze_dim=2 (heads维度)
-        cos = cos.unsqueeze(2) # (batch, seq, 1, dim)
-        sin = sin.unsqueeze(2)
-    else:
-        # 兼容旧逻辑：假设 seq_len 从 0 开始且连续 (训练时常用)
-        # 截取当前序列长度
-        seq_len = q.shape[1]
-        cos = cos[:seq_len].unsqueeze(unsqueeze_dim) # (seq, 1, dim)
-        sin = sin[:seq_len].unsqueeze(unsqueeze_dim)
-
-    # 2. 修正后的 rotate_half (LLaMA 风格)
-    # 配合 precompute 的 cat([cos, cos])，这里必须将 tensor 切分为前后两半
     def rotate_half(x):
-        x1, x2 = x.chunk(2, dim=-1) # 将最后一维切分成两半
-        return torch.cat((-x2, x1), dim=-1)
+        """将特征维度分成两半并交换位置（用于 RoPE 旋转）"""
+        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
 
-    # 3. 计算
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
-    对 KV 进行重复以匹配 Query 的头数
+    对 KV 进行重复以匹配 Query 的头数（用于 Grouped Query Attention）
     等价于 torch.repeat_interleave(x, dim=2, repeats=n_rep)，但更高效
     
     Args:
@@ -87,19 +96,22 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
-
 class Attention(nn.Module):
-    
-    def __init__(self,args):
+    """
+    多头注意力机制（支持 Grouped Query Attention 和 Flash Attention）
+    """
+    def __init__(self, args: SpongeBobConfig):
         super().__init__()
-        self.num_key_heads=args.num_attention_heads if args.num_key_heads is None else args.num_key_heads
-        assert args.num_attention_heads%self.num_key_heads==0
+        # GQA: 允许 KV 头数少于 Query 头数
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        assert args.num_attention_heads % self.num_key_value_heads == 0
         
-        self.num_heads=args.num_attention_heads
-        self.num_kv_heads=self.num_key_value_heads
-        self.n_rep=self.num_heads//self.num_kv_heads
-        self.head_dim=args.hidden_size//self.num_heads
+        self.num_heads = args.num_attention_heads  # Query 头数
+        self.num_kv_heads = self.num_key_value_heads  # KV 头数
+        self.n_rep = self.num_heads // self.num_kv_heads  # KV 重复次数
+        self.head_dim = args.hidden_size // args.num_attention_heads
         
+        # QKV 投影层
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
@@ -112,9 +124,8 @@ class Attention(nn.Module):
         
         # Flash Attention 支持检测
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
-        
-    
-def forward(self,
+
+    def forward(self,
                 x: torch.Tensor,
                 position_embeddings: Tuple[torch.Tensor, torch.Tensor],
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -213,7 +224,8 @@ def forward(self,
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
-  
+
+
 class FeedForward(nn.Module):
     """
     前馈神经网络（SwiGLU 激活函数）
@@ -235,10 +247,9 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         """SwiGLU: act(gate_proj(x)) * up_proj(x) -> down_proj"""
-        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))   
- 
- 
- 
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+
+
 class SpongeBobBlock(nn.Module):
     """
     Transformer 块：Self-Attention + FeedForward
@@ -275,6 +286,7 @@ class SpongeBobBlock(nn.Module):
         # FeedForward with residual connection
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
+
 
 class SpongeBobModel(nn.Module):
     """
@@ -358,6 +370,7 @@ class SpongeBobModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states, presents
 
+
 class SpongeBobForCausalLM(PreTrainedModel, GenerationMixin):
     """
     SpongeBob 因果语言模型（用于文本生成）
@@ -432,4 +445,4 @@ class SpongeBobForCausalLM(PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values, 
             hidden_states=hidden_states
         )
-        return output    
+        return output

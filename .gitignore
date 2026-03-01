@@ -1,0 +1,31 @@
+# 忽略所有二进制数据文件 (你的数据集)
+*.bin
+*.data
+*.idx
+
+# 忽略模型权重文件 (通常很大)
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+
+# 忽略日志文件夹 (SwanLab, TensorBoard)
+swanlog/
+logs/
+*.log
+
+# 忽略 Python 缓存文件
+__pycache__/
+*.py[cod]
+*.class
+.pytest_cache/
+
+# 忽略系统文件
+.DS_Store
+Thumbs.db
+
+# 忽略虚拟环境 (如果有)
+venv/
+env/
+.conda/
