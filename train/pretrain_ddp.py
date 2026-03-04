@@ -130,7 +130,7 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SpongeBob Pretraining")
-    parser.add_argument("--save_dir", type=str, default="../pretrain_out/exp_1", help="模型保存根目录")
+    parser.add_argument("--save_dir", type=str, default="../pretrain_out/exp_2", help="模型保存根目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=128, help="batch size")

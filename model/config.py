@@ -28,7 +28,7 @@ class SpongeBobConfig(PretrainedConfig):
             hidden_size: int = 768,
             num_hidden_layers: int = 12,
             num_attention_heads: int = 12,
-            num_key_value_heads: int = 4,
+            num_key_value_heads: int = 12,
             intermediate_size: int = 2048,##FFN中间维度
             vocab_size: int = 15000,
             
